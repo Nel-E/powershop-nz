@@ -162,19 +162,21 @@ query vouchersForAccount(
 }
 """
 
-_MEASUREMENTS_DAILY_RANGE_QUERY = """
+_MEASUREMENTS_RANGE_QUERY = """
 query measurementsPeriod(
   $accountNumber: String!
   $propertyId: ID!
   $startOn: Date!
   $endOn: Date!
+  $first: Int!
+  $readingFrequencyType: ReadingFrequencyType!
 ) {
   account(accountNumber: $accountNumber) {
     id
     property(id: $propertyId) {
       id
       measurements(
-        first: 62
+        first: $first
         startOn: $startOn
         endOn: $endOn
         timezone: "Pacific/Auckland"
@@ -182,7 +184,7 @@ query measurementsPeriod(
           electricityFilters: {
             readingDirection: CONSUMPTION
             readingQuality: COMBINED
-            readingFrequencyType: DAY_INTERVAL
+            readingFrequencyType: $readingFrequencyType
           }
         }]
       ) {
@@ -533,25 +535,30 @@ class PowershopAPIClient:
             return [e["node"] for e in measurements.get("edges", []) if e.get("node")]
         return []
 
-    async def get_measurements_date_range(
+    async def get_measurements_range(
         self,
         account_number: str,
         property_id: str,
         start_on: str,
         end_on: str,
+        freq: str,
     ) -> List[Dict[str, Any]]:
-        """Return daily measurement nodes for a specific date range.
+        """Return measurement nodes for a specific local-date range.
 
-        Each node includes ``metaData.utilityFilters.readingQuality`` so callers
-        can distinguish ``ACTUAL`` (already metered) from ``ESTIMATED`` readings.
+        This range-based query avoids assuming that every New Zealand local day
+        contains exactly 24 hourly intervals; daylight-saving transition days
+        can contain 23 or 25.
         """
+        first = 1000 if freq == "HOUR_INTERVAL" else 400
         data = await self._graphql(
-            _MEASUREMENTS_DAILY_RANGE_QUERY,
+            _MEASUREMENTS_RANGE_QUERY,
             {
                 "accountNumber": account_number,
                 "propertyId": property_id,
                 "startOn": start_on,
                 "endOn": end_on,
+                "first": first,
+                "readingFrequencyType": freq,
             },
         )
         measurements = (
@@ -562,6 +569,22 @@ class PowershopAPIClient:
         if isinstance(measurements, dict):
             return [e["node"] for e in measurements.get("edges", []) if e.get("node")]
         return []
+
+    async def get_measurements_date_range(
+        self,
+        account_number: str,
+        property_id: str,
+        start_on: str,
+        end_on: str,
+    ) -> List[Dict[str, Any]]:
+        """Return daily measurement nodes for a specific date range."""
+        return await self.get_measurements_range(
+            account_number,
+            property_id,
+            start_on,
+            end_on,
+            "DAY_INTERVAL",
+        )
 
     async def get_agreements(
         self, account_number: str, property_id: str
@@ -644,8 +667,15 @@ class PowershopAPIClient:
         today = local_today.isoformat()
         coros = (
             [
-                # hourly today (uses last/endOn; endOn is inclusive)
-                self.get_measurements(account_number, property_id, 24, today, "HOUR_INTERVAL"),
+                # Hourly today via explicit date range. This is DST-safe:
+                # an Auckland-local day may contain 23, 24, or 25 intervals.
+                self.get_measurements_range(
+                    account_number,
+                    property_id,
+                    today,
+                    today,
+                    "HOUR_INTERVAL",
+                ),
                 # current billing period daily (with readingQuality for USED/EST split)
                 self.get_measurements_date_range(
                     account_number, property_id,

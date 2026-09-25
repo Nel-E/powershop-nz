@@ -19,6 +19,8 @@ A Home Assistant custom component for **Powershop New Zealand** customers. Monit
 - **Passwordless Auth** — uses Powershop's email OTP login (no password stored)
 - **Automatic Token Refresh** — stays authenticated in the background
 - **Regular Updates** — 15-minute refresh interval
+- **Home Assistant Energy Dashboard** — imports Powershop hourly kWh and consumption cost as long-term statistics, with a 60-day initial backfill and automatic correction sync every 12 hours
+- **DST-safe Hourly Data** — handles New Zealand 23/24/25-hour daylight-saving days without assuming every day has exactly 24 intervals
 
 ## Requirements
 
@@ -33,7 +35,7 @@ A Home Assistant custom component for **Powershop New Zealand** customers. Monit
 1. Open **HACS** in Home Assistant
 2. Go to **Integrations**
 3. Click the three dots (⋮) in the top right corner and select **Custom repositories**
-4. Add `https://github.com/PMKA/powershop-nz` and select **Integration**
+4. Add `https://github.com/Nel-E/powershop-nz` and select **Integration**
 5. Click **Add**, then find **Powershop NZ** in the list and install it
 6. Restart Home Assistant
 
@@ -72,6 +74,50 @@ Your account number and property ID are discovered automatically. Home Assistant
 | `sensor.powershop_nz_voucher_balance` | Total redeemable Power Pack balance | NZD |
 | `sensor.powershop_nz_daily_charge` | Daily fixed (standing/line) charge | NZD |
 
+## Home Assistant Energy Dashboard
+
+Version 2.2.0 adds native long-term statistics for Home Assistant's Energy Dashboard.
+
+After installing/updating the integration and restarting Home Assistant, the integration automatically backfills the latest **60 days** of completed hourly Powershop data. Every 12 hours it re-imports the latest **30 days**, allowing Powershop estimates to be replaced by later actual meter readings.
+
+Two external statistics are created for each configured account/property:
+
+- `powershop_nz:<account>_<property>_energy_consumption` — cumulative imported electricity in kWh
+- `powershop_nz:<account>_<property>_energy_cost` — cumulative Powershop consumption cost in NZD
+
+The account/property portions are normalised to valid Home Assistant statistic IDs.
+
+### Add Powershop to the Energy Dashboard
+
+1. Go to **Settings → Dashboards → Energy**
+2. Under **Electricity grid**, add or edit **Grid consumption**
+3. For imported energy, select the statistic whose name begins **Powershop NZ electricity consumption**
+4. For cost, choose **Use an entity/statistic tracking total costs**
+5. Select **Powershop NZ electricity cost**
+
+The cost statistic uses the interval consumption cost returned by Powershop rather than recalculating cost from the displayed peak/off-peak rate sensors. The daily standing charge remains separate and is not included in the Energy Dashboard consumption-cost statistic.
+
+### Manual history backfill
+
+A service action is available at **Developer Tools → Actions**:
+
+`powershop_nz.backfill_energy_statistics`
+
+Fields:
+
+- `days` — number of local calendar days to import, from 1 to 365 (default 60)
+- `config_entry_id` — optional unless more than one Powershop NZ account is configured
+
+The action returns the number of imported hourly rows and the generated statistic IDs.
+
+### Updating this fork with HACS
+
+Add this fork as the HACS custom repository:
+
+`https://github.com/Nel-E/powershop-nz`
+
+HACS installs from the repository's default branch/release, so Energy Dashboard changes are merged to `main` and the integration manifest version is **2.2.0**. After HACS downloads the update, restart Home Assistant.
+
 ### Sensor Attributes
 
 **`sensor.powershop_nz_period_estimated_cost`** includes an `upcoming_periods` attribute — a list of the next 5 billing periods, each containing:
@@ -93,6 +139,14 @@ Your account number and property ID are discovered automatically. Home Assistant
 **"Email address not found" during setup** Even if your email is correct, this can happen if your account hasn't yet been migrated to Powershop's new platform. Powershop is doing a staged rollout — check if you can log in at app.powershop.nz first. If you can't, your account isn't on the new system yet and you'll need to wait or contact Powershop.
 
 ## 📝 Changelog
+
+### v2.2.0 (2026-09-26)
+- Added Home Assistant Energy Dashboard long-term statistics for hourly Powershop electricity consumption and interval consumption cost
+- Added automatic 60-day initial backfill and 30-day rolling correction sync every 12 hours
+- Added `powershop_nz.backfill_energy_statistics` for manual 1–365 day imports
+- Hourly measurement retrieval now uses explicit local-date ranges so NZ daylight-saving days with 23 or 25 intervals are handled correctly
+- Powershop estimated hourly readings can be overwritten by later actual meter readings at their original timestamps
+- Added Home Assistant `recorder` dependency for external statistics support
 
 ### v2.1.4 (2026-06-23)
 - Fixed `sensor.powershop_nz_daily_charge` logging a HA validation warning on startup — the sensor was incorrectly using `state_class=MEASUREMENT` with `device_class=MONETARY`, which HA does not allow. The daily standing charge is a fixed tariff rate, not an accumulating total, so it now uses `state_class=None` with no device class — matching the pattern of the other rate sensors
