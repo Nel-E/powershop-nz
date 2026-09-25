@@ -10,8 +10,10 @@ CONF_PROPERTY_ID = "property_id"
 
 # Service action names and fields
 SERVICE_GET_HOURLY_USAGE = "get_hourly_usage"
+SERVICE_BACKFILL_ENERGY_STATISTICS = "backfill_energy_statistics"
 ATTR_CONFIG_ENTRY_ID = "config_entry_id"
 ATTR_DATE = "date"
+ATTR_DAYS = "days"
 
 # Production Firebase config — Powershop's own public project identifier.
 #
