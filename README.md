@@ -140,6 +140,10 @@ HACS installs from the repository's default branch/release, so Energy Dashboard 
 
 ## 📝 Changelog
 
+### v2.2.1 (2026-09-26)
+- Wait for Home Assistant Recorder to commit imported external statistics before the backfill action returns
+- Read the consumption and cost statistics back from Recorder and return `recorder_verified`, `latest_consumption_statistic`, and `latest_cost_statistic` in the action response for direct diagnostics
+
 ### v2.2.0 (2026-09-26)
 - Added Home Assistant Energy Dashboard long-term statistics for hourly Powershop electricity consumption and interval consumption cost
 - Added automatic 60-day initial backfill and 30-day rolling correction sync every 12 hours

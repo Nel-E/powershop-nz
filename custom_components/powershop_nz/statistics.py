@@ -228,6 +228,14 @@ class PowershopStatisticsManager:
                 cost_statistics,
             )
 
+            # External statistics writes are queued on Recorder. Wait for the
+            # queue to commit, then read both statistics back so the service
+            # response proves whether Recorder actually persisted them.
+            recorder = get_instance(self.hass)
+            await recorder.async_block_till_done()
+
+            persisted = await self._async_get_persisted_status()
+
             return {
                 "days": days,
                 "hourly_rows": len(rows),
@@ -235,7 +243,58 @@ class PowershopStatisticsManager:
                 "last_hour": rows[-1]["_start"].isoformat(),
                 "consumption_statistic_id": self.consumption_statistic_id,
                 "cost_statistic_id": self.cost_statistic_id,
+                **persisted,
             }
+
+    async def _async_get_persisted_status(self) -> dict[str, Any]:
+        """Read back the latest imported statistics from Recorder."""
+        recorder = get_instance(self.hass)
+
+        consumption = await recorder.async_add_executor_job(
+            get_last_statistics,
+            self.hass,
+            1,
+            self.consumption_statistic_id,
+            True,
+            {"state", "sum"},
+        )
+        cost = await recorder.async_add_executor_job(
+            get_last_statistics,
+            self.hass,
+            1,
+            self.cost_statistic_id,
+            True,
+            {"state", "sum"},
+        )
+
+        consumption_rows = consumption.get(self.consumption_statistic_id, [])
+        cost_rows = cost.get(self.cost_statistic_id, [])
+
+        def _format_latest(rows: list[Any]) -> dict[str, Any] | None:
+            if not rows:
+                return None
+            row = rows[0]
+            start = row.get("start")
+            return {
+                "start": (
+                    dt_util.utc_from_timestamp(start).isoformat()
+                    if isinstance(start, (int, float))
+                    else start.isoformat()
+                    if isinstance(start, datetime)
+                    else None
+                ),
+                "state": row.get("state"),
+                "sum": row.get("sum"),
+            }
+
+        consumption_latest = _format_latest(consumption_rows)
+        cost_latest = _format_latest(cost_rows)
+
+        return {
+            "recorder_verified": bool(consumption_latest and cost_latest),
+            "latest_consumption_statistic": consumption_latest,
+            "latest_cost_statistic": cost_latest,
+        }
 
     async def _async_has_statistics(self) -> bool:
         """Return whether the consumption statistic already has data."""
