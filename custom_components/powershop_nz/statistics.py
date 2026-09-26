@@ -116,6 +116,9 @@ class PowershopStatisticsManager:
         self.standing_charge_statistic_id = (
             f"{DOMAIN}:{self._id_prefix}_standing_charge_cost"
         )
+        self.standing_charge_energy_statistic_id = (
+            f"{DOMAIN}:{self._id_prefix}_standing_charge_energy"
+        )
 
         self._consumption_metadata = self._energy_metadata(
             self.consumption_statistic_id,
@@ -128,6 +131,10 @@ class PowershopStatisticsManager:
         self._standing_metadata = self._cost_metadata_for(
             self.standing_charge_statistic_id,
             f"Powershop NZ standing charge cost{self._name_suffix}",
+        )
+        self._standing_energy_metadata = self._energy_metadata(
+            self.standing_charge_energy_statistic_id,
+            f"Powershop NZ Daily Charge (0 kWh){self._name_suffix}",
         )
 
     def _energy_metadata(self, statistic_id: str, name: str) -> StatisticMetaData:
@@ -236,9 +243,12 @@ class PowershopStatisticsManager:
                 has_standing = await self._async_has_statistic(
                     self.standing_charge_statistic_id
                 )
+                has_standing_energy = await self._async_has_statistic(
+                    self.standing_charge_energy_statistic_id
+                )
                 days = (
                     ROLLING_SYNC_DAYS
-                    if has_consumption and has_standing
+                    if has_consumption and has_standing and has_standing_energy
                     else INITIAL_BACKFILL_DAYS
                 )
 
@@ -297,6 +307,9 @@ class PowershopStatisticsManager:
                     "consumption_statistic_id": self.consumption_statistic_id,
                     "cost_statistic_id": self.cost_statistic_id,
                     "standing_charge_statistic_id": self.standing_charge_statistic_id,
+                    "standing_charge_energy_statistic_id": (
+                        self.standing_charge_energy_statistic_id
+                    ),
                 }
 
             period_keys = set((tou.get("rate_bands") or {}).keys())
@@ -342,6 +355,7 @@ class PowershopStatisticsManager:
             consumption_stats: list[StatisticData] = []
             cost_stats: list[StatisticData] = []
             standing_stats: list[StatisticData] = []
+            standing_energy_stats: list[StatisticData] = []
             period_energy_stats: dict[str, list[StatisticData]] = defaultdict(list)
             period_cost_stats: dict[str, list[StatisticData]] = defaultdict(list)
 
@@ -375,6 +389,17 @@ class PowershopStatisticsManager:
                         start=start,
                         state=round(standing_state, 6),
                         sum=standing_sum,
+                    )
+                )
+                # Home Assistant requires every grid source to have an energy
+                # statistic. The Daily Charge source carries no electricity,
+                # so this companion meter is intentionally always 0 kWh while
+                # its paired cost statistic carries the standing charge.
+                standing_energy_stats.append(
+                    StatisticData(
+                        start=start,
+                        state=0.0,
+                        sum=0.0,
                     )
                 )
 
@@ -413,6 +438,11 @@ class PowershopStatisticsManager:
             )
             async_add_external_statistics(
                 self.hass, self._standing_metadata, standing_stats
+            )
+            async_add_external_statistics(
+                self.hass,
+                self._standing_energy_metadata,
+                standing_energy_stats,
             )
 
             rate_bands = tou.get("rate_bands") or {}
@@ -473,6 +503,9 @@ class PowershopStatisticsManager:
                 "consumption_statistic_id": self.consumption_statistic_id,
                 "cost_statistic_id": self.cost_statistic_id,
                 "standing_charge_statistic_id": self.standing_charge_statistic_id,
+                "standing_charge_energy_statistic_id": (
+                    self.standing_charge_energy_statistic_id
+                ),
                 "tariff_periods": tariff_periods,
                 **persisted,
             }
@@ -622,14 +655,21 @@ class PowershopStatisticsManager:
         consumption_latest = await latest(self.consumption_statistic_id)
         cost_latest = await latest(self.cost_statistic_id)
         standing_latest = await latest(self.standing_charge_statistic_id)
+        standing_energy_latest = await latest(
+            self.standing_charge_energy_statistic_id
+        )
 
         return {
             "recorder_verified": bool(
-                consumption_latest and cost_latest and standing_latest
+                consumption_latest
+                and cost_latest
+                and standing_latest
+                and standing_energy_latest
             ),
             "latest_consumption_statistic": consumption_latest,
             "latest_cost_statistic": cost_latest,
             "latest_standing_charge_statistic": standing_latest,
+            "latest_standing_charge_energy_statistic": standing_energy_latest,
         }
 
     async def _async_has_statistic(self, statistic_id: str) -> bool:
