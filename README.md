@@ -263,6 +263,55 @@ HACS installs the published GitHub release. After downloading an update, **resta
 
 **`sensor.powershop_nz_voucher_balance`** includes a `vouchers` attribute listing every active pack with its name, available-from date, remaining balance, and original value.
 
+## TODO — Billing-period usage clarity
+
+The current code is intentionally being left unchanged while these two improvements are evaluated.
+
+### 1. Separate actual, accrued-to-now, and full-period estimated usage
+
+**Problem we are trying to fix:** `sensor.powershop_nz_usage_billing_period` currently sums both `ACTUAL` and future `ESTIMATE` daily measurements for the complete Powershop billing period. That makes the sensor name **Usage This Billing Period** misleading, because the value can include electricity that has not happened yet.
+
+Observed example for the 2 Sep–1 Oct 2026 billing period:
+
+- Powershop Usage screen / confirmed `ACTUAL` usage: about **865.44 kWh**
+- Home Assistant Energy Dashboard at that point in time: about **916.62 kWh** — actual usage plus estimated intervals that had elapsed up to "now"
+- Current `Usage This Billing Period` sensor: about **1089.98 kWh** — actual usage plus all future estimated days through the billing-period end
+
+**Proposed change:**
+
+- make **Usage This Billing Period** actual-only (sum of `reading_quality: ACTUAL`)
+- add **Estimated Usage This Billing Period** for the complete billing-period forecast (ACTUAL + ESTIMATE)
+- keep the existing Energy Dashboard long-term statistics unchanged; they should continue to represent energy accrued chronologically up to the present rather than preloading future estimates
+
+The goal is a clear three-number model:
+
+1. **Actual usage** — confirmed meter readings only
+2. **Accrued usage to now** — what the Energy Dashboard currently represents
+3. **Estimated full-period usage** — forecast through the end of the current Powershop billing cycle
+
+### 2. Add billing-cycle reporting based on Powershop's real billing dates
+
+**Problem we are trying to fix:** Home Assistant's built-in Energy Dashboard groups data by normal calendar day/week/month ranges, while a Powershop billing period can span different dates — for example **2 Sep–1 Oct**. A calendar "September" total therefore should not be assumed to equal a Powershop bill-period total.
+
+The Powershop GraphQL API already provides authoritative current billing-cycle fields:
+
+- `currentBillingPeriodStartDate`
+- `currentBillingPeriodEndDate`
+- `nextBillingDate`
+
+The integration already reads these fields and exposes the current start/end dates as sensor attributes.
+
+**Proposed change:**
+
+- add a separate billing-period summary/report using the API-provided billing start/end dates
+- report actual usage, accrued usage/cost to now, forecast usage/cost, Peak cost, Off Peak cost, and Daily Charge for the true Powershop billing period
+- do **not** alter or remap the built-in Energy Dashboard's calendar-based history
+
+The goal is to provide both views without mixing their meanings:
+
+- **Energy Dashboard:** chronological/calendar reporting
+- **Powershop billing-period summary:** exact retailer billing-cycle reporting
+
 ## Troubleshooting
 
 **No OTP email?** Check spam, make sure you're using the right address, and try again, i found at some times of day the emails were slow to come through.
