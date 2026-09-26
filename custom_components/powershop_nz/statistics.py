@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timedelta, timezone
+from collections import defaultdict
+from datetime import date, datetime, time, timedelta, timezone
 import logging
 import re
 from typing import Any
@@ -26,8 +27,13 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import EnergyConverter
 
-from .api import PowershopAPIClient, normalise_hourly_usage
+from .api import (
+    PowershopAPIClient,
+    measurement_standing_charge_nzd,
+    measurement_usage_cost_nzd,
+)
 from .const import CONF_ACCOUNT_NUMBER, CONF_PROPERTY_ID, DOMAIN
+from .tou import extract_agreement_tou, extract_interval_band_entries, safe_stat_key
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,7 +41,7 @@ NZ_TZ = ZoneInfo("Pacific/Auckland")
 INITIAL_BACKFILL_DAYS = 60
 ROLLING_SYNC_DAYS = 30
 SYNC_INTERVAL = timedelta(hours=12)
-FETCH_CHUNK_DAYS = 4
+FETCH_CHUNK_DAYS = 7
 
 
 def _safe_statistic_component(value: str) -> str:
@@ -56,6 +62,25 @@ def _parse_datetime(value: Any) -> datetime | None:
     return dt_util.as_utc(parsed)
 
 
+def _format_latest(rows: list[Any]) -> dict[str, Any] | None:
+    """Return a service-response-friendly representation of one stat row."""
+    if not rows:
+        return None
+    row = rows[0]
+    start = row.get("start")
+    return {
+        "start": (
+            dt_util.utc_from_timestamp(start).isoformat()
+            if isinstance(start, (int, float))
+            else start.isoformat()
+            if isinstance(start, datetime)
+            else None
+        ),
+        "state": row.get("state"),
+        "sum": row.get("sum"),
+    }
+
+
 class PowershopStatisticsManager:
     """Import Powershop interval data into Home Assistant long-term statistics."""
 
@@ -74,33 +99,69 @@ class PowershopStatisticsManager:
 
         account_number = str(config_entry.data[CONF_ACCOUNT_NUMBER])
         property_id = str(config_entry.data[CONF_PROPERTY_ID])
-        id_prefix = (
+        self._id_prefix = (
             f"{_safe_statistic_component(account_number)}_"
             f"{_safe_statistic_component(property_id)}"
         )
-        self.consumption_statistic_id = (
-            f"{DOMAIN}:{id_prefix}_energy_consumption"
-        )
-        self.cost_statistic_id = f"{DOMAIN}:{id_prefix}_energy_cost"
+        self._name_suffix = f" ({account_number})"
 
-        name_suffix = f" ({account_number})"
-        self._consumption_metadata = StatisticMetaData(
+        # Keep the v2.2 IDs stable so existing Energy Dashboard configuration
+        # continues to work after upgrading.
+        self.consumption_statistic_id = (
+            f"{DOMAIN}:{self._id_prefix}_energy_consumption"
+        )
+        self.cost_statistic_id = (
+            f"{DOMAIN}:{self._id_prefix}_energy_cost"
+        )
+        self.standing_charge_statistic_id = (
+            f"{DOMAIN}:{self._id_prefix}_standing_charge_cost"
+        )
+
+        self._consumption_metadata = self._energy_metadata(
+            self.consumption_statistic_id,
+            f"Powershop NZ electricity consumption{self._name_suffix}",
+        )
+        self._cost_metadata = self._cost_metadata_for(
+            self.cost_statistic_id,
+            f"Powershop NZ electricity cost{self._name_suffix}",
+        )
+        self._standing_metadata = self._cost_metadata_for(
+            self.standing_charge_statistic_id,
+            f"Powershop NZ standing charge cost{self._name_suffix}",
+        )
+
+    def _energy_metadata(self, statistic_id: str, name: str) -> StatisticMetaData:
+        return StatisticMetaData(
             mean_type=StatisticMeanType.NONE,
             has_sum=True,
-            name=f"Powershop NZ electricity consumption{name_suffix}",
+            name=name,
             source=DOMAIN,
-            statistic_id=self.consumption_statistic_id,
+            statistic_id=statistic_id,
             unit_class=EnergyConverter.UNIT_CLASS,
             unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         )
-        self._cost_metadata = StatisticMetaData(
+
+    def _cost_metadata_for(self, statistic_id: str, name: str) -> StatisticMetaData:
+        return StatisticMetaData(
             mean_type=StatisticMeanType.NONE,
             has_sum=True,
-            name=f"Powershop NZ electricity cost{name_suffix}",
+            name=name,
             source=DOMAIN,
-            statistic_id=self.cost_statistic_id,
+            statistic_id=statistic_id,
             unit_class=None,
             unit_of_measurement=None,
+        )
+
+    def _period_energy_id(self, period_key: str) -> str:
+        return (
+            f"{DOMAIN}:{self._id_prefix}_energy_consumption_"
+            f"{safe_stat_key(period_key)}"
+        )
+
+    def _period_cost_id(self, period_key: str) -> str:
+        return (
+            f"{DOMAIN}:{self._id_prefix}_energy_cost_"
+            f"{safe_stat_key(period_key)}"
         )
 
     def start(self) -> None:
@@ -150,226 +211,442 @@ class PowershopStatisticsManager:
             _LOGGER.exception("Powershop statistics %s sync failed", reason)
             return
 
-        _LOGGER.debug(
-            "Powershop statistics %s sync complete: %s",
-            reason,
-            result,
-        )
+        _LOGGER.debug("Powershop statistics %s sync complete: %s", reason, result)
 
     async def async_sync(self, days: int | None = None) -> dict[str, Any]:
-        """Import hourly Powershop usage and cost into long-term statistics.
+        """Import Powershop consumption, total cost, daily charge and TOU stats.
 
-        If *days* is omitted, the first import backfills 60 days. Subsequent
-        automatic imports re-read the latest 30 days so Powershop can replace
-        estimated readings with actual meter data.
+        Existing v2.2 total consumption/cost statistic IDs are retained. On the
+        first v2.3 sync, absence of the standing-charge statistic triggers a
+        60-day migration backfill so existing total-cost history is rewritten
+        with the daily charge included. Later automatic syncs re-read 30 days
+        so Powershop estimate-to-actual corrections can overwrite history.
         """
         async with self._lock:
             if days is None:
-                has_statistics = await self._async_has_statistics()
-                days = ROLLING_SYNC_DAYS if has_statistics else INITIAL_BACKFILL_DAYS
+                has_consumption = await self._async_has_statistic(
+                    self.consumption_statistic_id
+                )
+                has_standing = await self._async_has_statistic(
+                    self.standing_charge_statistic_id
+                )
+                days = (
+                    ROLLING_SYNC_DAYS
+                    if has_consumption and has_standing
+                    else INITIAL_BACKFILL_DAYS
+                )
 
             days = max(1, int(days))
             local_today = datetime.now(NZ_TZ).date()
             start_date = local_today - timedelta(days=days - 1)
 
-            rows = await self._async_fetch_hourly_rows(start_date, local_today)
-            rows = self._prepare_rows(rows)
+            account_number = self.config_entry.data[CONF_ACCOUNT_NUMBER]
+            property_id = self.config_entry.data[CONF_PROPERTY_ID]
 
-            if not rows:
+            agreement_data = await self.client.get_agreements(
+                account_number, property_id
+            )
+            tou = extract_agreement_tou(agreement_data)
+
+            # Half-hour data lets tariff boundaries such as 09:30 be allocated
+            # accurately. Fall back to hourly if this account does not expose
+            # THIRTY_MIN_INTERVAL.
+            try:
+                interval_nodes = await self._async_fetch_interval_nodes(
+                    start_date, local_today, "THIRTY_MIN_INTERVAL"
+                )
+            except Exception as err:
+                _LOGGER.warning(
+                    "Powershop half-hour data unavailable; falling back to hourly: %s",
+                    err,
+                )
+                interval_nodes = []
+
+            source_frequency = "THIRTY_MIN_INTERVAL"
+            if not interval_nodes:
+                source_frequency = "HOUR_INTERVAL"
+                interval_nodes = await self._async_fetch_interval_nodes(
+                    start_date, local_today, source_frequency
+                )
+
+            daily_nodes = await self.client.get_measurements_date_range(
+                account_number,
+                property_id,
+                start_date.isoformat(),
+                local_today.isoformat(),
+            )
+
+            hourly, detected_periods = self._aggregate_interval_nodes(
+                interval_nodes, tou
+            )
+            standing_charge_days = self._merge_daily_charges(
+                hourly, daily_nodes, tou, local_today
+            )
+
+            if not hourly:
                 return {
                     "days": days,
                     "hourly_rows": 0,
+                    "source_frequency": source_frequency,
                     "consumption_statistic_id": self.consumption_statistic_id,
                     "cost_statistic_id": self.cost_statistic_id,
+                    "standing_charge_statistic_id": self.standing_charge_statistic_id,
                 }
 
-            first_start = rows[0]["_start"]
-            base_sums = await self._async_get_base_sums(first_start)
+            period_keys = set((tou.get("rate_bands") or {}).keys())
+            period_keys.update(detected_periods)
+            period_keys = {key for key in period_keys if key}
+
+            timeline = sorted(hourly)
+            first_start = timeline[0]
+
+            period_ids: dict[str, dict[str, str]] = {
+                key: {
+                    "consumption": self._period_energy_id(key),
+                    "cost": self._period_cost_id(key),
+                }
+                for key in sorted(period_keys)
+            }
+
+            all_statistic_ids = {
+                self.consumption_statistic_id,
+                self.cost_statistic_id,
+                self.standing_charge_statistic_id,
+            }
+            for ids in period_ids.values():
+                all_statistic_ids.update(ids.values())
+
+            base_sums = await self._async_get_base_sums(
+                first_start, all_statistic_ids
+            )
+
             consumption_sum = base_sums[self.consumption_statistic_id]
             cost_sum = base_sums[self.cost_statistic_id]
+            standing_sum = base_sums[self.standing_charge_statistic_id]
 
-            consumption_statistics: list[StatisticData] = []
-            cost_statistics: list[StatisticData] = []
+            period_energy_sums = {
+                key: base_sums[ids["consumption"]]
+                for key, ids in period_ids.items()
+            }
+            period_cost_sums = {
+                key: base_sums[ids["cost"]]
+                for key, ids in period_ids.items()
+            }
 
-            for row in rows:
-                start = row["_start"]
-                consumption_state = max(0.0, float(row.get("kwh") or 0.0))
-                cost_state = max(
-                    0.0,
-                    float(row.get("cost_incl_tax_estimated_nzd") or 0.0),
-                )
+            consumption_stats: list[StatisticData] = []
+            cost_stats: list[StatisticData] = []
+            standing_stats: list[StatisticData] = []
+            period_energy_stats: dict[str, list[StatisticData]] = defaultdict(list)
+            period_cost_stats: dict[str, list[StatisticData]] = defaultdict(list)
+
+            for start in timeline:
+                bucket = hourly[start]
+                consumption_state = max(0.0, float(bucket["kwh"]))
+                usage_cost_state = max(0.0, float(bucket["usage_cost_nzd"]))
+                standing_state = max(0.0, float(bucket["standing_charge_nzd"]))
+                total_cost_state = usage_cost_state + standing_state
 
                 consumption_sum = round(consumption_sum + consumption_state, 6)
-                cost_sum = round(cost_sum + cost_state, 6)
+                cost_sum = round(cost_sum + total_cost_state, 6)
+                standing_sum = round(standing_sum + standing_state, 6)
 
-                consumption_statistics.append(
+                consumption_stats.append(
                     StatisticData(
                         start=start,
                         state=consumption_state,
                         sum=consumption_sum,
                     )
                 )
-                cost_statistics.append(
+                cost_stats.append(
                     StatisticData(
                         start=start,
-                        state=cost_state,
+                        state=round(total_cost_state, 6),
                         sum=cost_sum,
                     )
                 )
+                standing_stats.append(
+                    StatisticData(
+                        start=start,
+                        state=round(standing_state, 6),
+                        sum=standing_sum,
+                    )
+                )
+
+                for key in sorted(period_keys):
+                    period_values = bucket["periods"].get(key, (0.0, 0.0))
+                    period_kwh = max(0.0, float(period_values[0]))
+                    period_cost = max(0.0, float(period_values[1]))
+
+                    period_energy_sums[key] = round(
+                        period_energy_sums[key] + period_kwh, 6
+                    )
+                    period_cost_sums[key] = round(
+                        period_cost_sums[key] + period_cost, 6
+                    )
+
+                    period_energy_stats[key].append(
+                        StatisticData(
+                            start=start,
+                            state=period_kwh,
+                            sum=period_energy_sums[key],
+                        )
+                    )
+                    period_cost_stats[key].append(
+                        StatisticData(
+                            start=start,
+                            state=period_cost,
+                            sum=period_cost_sums[key],
+                        )
+                    )
 
             async_add_external_statistics(
-                self.hass,
-                self._consumption_metadata,
-                consumption_statistics,
+                self.hass, self._consumption_metadata, consumption_stats
             )
             async_add_external_statistics(
-                self.hass,
-                self._cost_metadata,
-                cost_statistics,
+                self.hass, self._cost_metadata, cost_stats
+            )
+            async_add_external_statistics(
+                self.hass, self._standing_metadata, standing_stats
             )
 
-            # External statistics writes are queued on Recorder. Wait for the
-            # queue to commit, then read both statistics back so the service
-            # response proves whether Recorder actually persisted them.
+            rate_bands = tou.get("rate_bands") or {}
+            for key in sorted(period_keys):
+                band = rate_bands.get(key) or {}
+                display_name = str(
+                    band.get("name")
+                    or key.replace("_", " ").title()
+                )
+                ids = period_ids[key]
+
+                async_add_external_statistics(
+                    self.hass,
+                    self._energy_metadata(
+                        ids["consumption"],
+                        (
+                            f"Powershop NZ {display_name} consumption"
+                            f"{self._name_suffix}"
+                        ),
+                    ),
+                    period_energy_stats[key],
+                )
+                async_add_external_statistics(
+                    self.hass,
+                    self._cost_metadata_for(
+                        ids["cost"],
+                        f"Powershop NZ {display_name} cost{self._name_suffix}",
+                    ),
+                    period_cost_stats[key],
+                )
+
             recorder = get_instance(self.hass)
             await recorder.async_block_till_done()
-
             persisted = await self._async_get_persisted_status()
+
+            tariff_periods = []
+            for key in sorted(period_keys):
+                band = rate_bands.get(key) or {}
+                tariff_periods.append(
+                    {
+                        "key": key,
+                        "name": band.get("name")
+                        or key.replace("_", " ").title(),
+                        "bucket": band.get("bucket"),
+                        "rate_nzd_per_kwh": band.get("rate_nzd_per_kwh"),
+                        "consumption_statistic_id": period_ids[key]["consumption"],
+                        "cost_statistic_id": period_ids[key]["cost"],
+                    }
+                )
 
             return {
                 "days": days,
-                "hourly_rows": len(rows),
-                "first_hour": rows[0]["_start"].isoformat(),
-                "last_hour": rows[-1]["_start"].isoformat(),
+                "hourly_rows": len(timeline),
+                "source_frequency": source_frequency,
+                "first_hour": timeline[0].isoformat(),
+                "last_hour": timeline[-1].isoformat(),
+                "standing_charge_days": standing_charge_days,
                 "consumption_statistic_id": self.consumption_statistic_id,
                 "cost_statistic_id": self.cost_statistic_id,
+                "standing_charge_statistic_id": self.standing_charge_statistic_id,
+                "tariff_periods": tariff_periods,
                 **persisted,
             }
 
-    async def _async_get_persisted_status(self) -> dict[str, Any]:
-        """Read back the latest imported statistics from Recorder."""
-        recorder = get_instance(self.hass)
-
-        consumption = await recorder.async_add_executor_job(
-            get_last_statistics,
-            self.hass,
-            1,
-            self.consumption_statistic_id,
-            True,
-            {"state", "sum"},
-        )
-        cost = await recorder.async_add_executor_job(
-            get_last_statistics,
-            self.hass,
-            1,
-            self.cost_statistic_id,
-            True,
-            {"state", "sum"},
-        )
-
-        consumption_rows = consumption.get(self.consumption_statistic_id, [])
-        cost_rows = cost.get(self.cost_statistic_id, [])
-
-        def _format_latest(rows: list[Any]) -> dict[str, Any] | None:
-            if not rows:
-                return None
-            row = rows[0]
-            start = row.get("start")
-            return {
-                "start": (
-                    dt_util.utc_from_timestamp(start).isoformat()
-                    if isinstance(start, (int, float))
-                    else start.isoformat()
-                    if isinstance(start, datetime)
-                    else None
-                ),
-                "state": row.get("state"),
-                "sum": row.get("sum"),
-            }
-
-        consumption_latest = _format_latest(consumption_rows)
-        cost_latest = _format_latest(cost_rows)
-
-        return {
-            "recorder_verified": bool(consumption_latest and cost_latest),
-            "latest_consumption_statistic": consumption_latest,
-            "latest_cost_statistic": cost_latest,
-        }
-
-    async def _async_has_statistics(self) -> bool:
-        """Return whether the consumption statistic already has data."""
-        stats = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics,
-            self.hass,
-            1,
-            self.consumption_statistic_id,
-            True,
-            {"sum"},
-        )
-        return bool(stats.get(self.consumption_statistic_id))
-
-    async def _async_fetch_hourly_rows(
+    async def _async_fetch_interval_nodes(
         self,
         start_date: date,
         end_date: date,
+        frequency: str,
     ) -> list[dict[str, Any]]:
-        """Fetch hourly data in small date chunks safe for GraphQL connection limits."""
+        """Fetch interval nodes in date chunks safe for GraphQL limits."""
         account_number = self.config_entry.data[CONF_ACCOUNT_NUMBER]
         property_id = self.config_entry.data[CONF_PROPERTY_ID]
 
-        rows: list[dict[str, Any]] = []
+        nodes: list[dict[str, Any]] = []
         chunk_start = start_date
         while chunk_start <= end_date:
             chunk_end = min(
                 chunk_start + timedelta(days=FETCH_CHUNK_DAYS - 1),
                 end_date,
             )
-            nodes = await self.client.get_measurements_range(
-                account_number,
-                property_id,
-                chunk_start.isoformat(),
-                chunk_end.isoformat(),
-                "HOUR_INTERVAL",
+            nodes.extend(
+                await self.client.get_measurements_range(
+                    account_number,
+                    property_id,
+                    chunk_start.isoformat(),
+                    chunk_end.isoformat(),
+                    frequency,
+                )
             )
-            rows.extend(normalise_hourly_usage(nodes))
             chunk_start = chunk_end + timedelta(days=1)
+        return nodes
 
-        return rows
+    def _empty_hour_bucket(self) -> dict[str, Any]:
+        return {
+            "kwh": 0.0,
+            "usage_cost_nzd": 0.0,
+            "standing_charge_nzd": 0.0,
+            "periods": defaultdict(lambda: [0.0, 0.0]),
+        }
 
-    def _prepare_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Parse, de-duplicate, sort, and remove future/incomplete intervals."""
+    def _aggregate_interval_nodes(
+        self,
+        nodes: list[dict[str, Any]],
+        tou: dict[str, Any],
+    ) -> tuple[dict[datetime, dict[str, Any]], set[str]]:
+        """Aggregate raw interval nodes into UTC-aligned hourly buckets."""
         now_utc = datetime.now(timezone.utc)
-        prepared: dict[datetime, dict[str, Any]] = {}
+        hourly: dict[datetime, dict[str, Any]] = {}
+        detected_periods: set[str] = set()
 
-        for row in rows:
-            start = _parse_datetime(row.get("start_at"))
-            if start is None:
+        for node in nodes:
+            start_utc = _parse_datetime(node.get("startAt"))
+            if start_utc is None:
                 continue
 
-            end = _parse_datetime(row.get("end_at"))
-            if end is not None and end > now_utc:
+            end_utc = _parse_datetime(node.get("endAt"))
+            if end_utc is not None and end_utc > now_utc:
                 continue
-            if end is None and start >= now_utc:
+            if end_utc is None and start_utc >= now_utc:
                 continue
 
-            prepared[start] = {**row, "_start": start}
+            local_start = start_utc.astimezone(NZ_TZ)
+            local_hour = local_start.replace(
+                minute=0, second=0, microsecond=0
+            )
+            hour_start = local_hour.astimezone(timezone.utc)
 
-        return [prepared[key] for key in sorted(prepared)]
+            bucket = hourly.setdefault(hour_start, self._empty_hour_bucket())
+
+            try:
+                kwh = max(0.0, float(node.get("value") or 0))
+            except (TypeError, ValueError):
+                kwh = 0.0
+
+            bucket["kwh"] += kwh
+            bucket["usage_cost_nzd"] += measurement_usage_cost_nzd(node)
+
+            for period_key, period_kwh, period_cost in extract_interval_band_entries(
+                node, tou, local_start
+            ):
+                if not period_key:
+                    continue
+                detected_periods.add(period_key)
+                bucket["periods"][period_key][0] += period_kwh
+                bucket["periods"][period_key][1] += period_cost
+
+        return hourly, detected_periods
+
+    def _merge_daily_charges(
+        self,
+        hourly: dict[datetime, dict[str, Any]],
+        daily_nodes: list[dict[str, Any]],
+        tou: dict[str, Any],
+        local_today: date,
+    ) -> int:
+        """Merge one authoritative standing charge into each local day."""
+        charge_by_date: dict[date, float] = {}
+        current_rate = float(tou.get("standing_rate_nzd") or 0.0)
+
+        for node in daily_nodes:
+            start_utc = _parse_datetime(node.get("startAt"))
+            if start_utc is None:
+                continue
+            local_date = start_utc.astimezone(NZ_TZ).date()
+            if local_date > local_today:
+                continue
+
+            charge = measurement_standing_charge_nzd(node)
+            if local_date == local_today and current_rate > 0:
+                # The current daily node may be prorated while the day is still
+                # in progress. The contract standing charge is billed per day.
+                charge = current_rate
+            if charge > 0:
+                charge_by_date[local_date] = charge
+
+        # If today's daily measurement has not arrived yet, the active
+        # agreement still tells us the full standing charge for today.
+        if local_today not in charge_by_date and current_rate > 0:
+            charge_by_date[local_today] = current_rate
+
+        for local_date, charge in charge_by_date.items():
+            local_midnight = datetime.combine(
+                local_date, time.min, tzinfo=NZ_TZ
+            )
+            hour_start = local_midnight.astimezone(timezone.utc)
+            bucket = hourly.setdefault(hour_start, self._empty_hour_bucket())
+            bucket["standing_charge_nzd"] = charge
+
+        return len(charge_by_date)
+
+    async def _async_get_persisted_status(self) -> dict[str, Any]:
+        """Read back the latest main statistics from Recorder."""
+        recorder = get_instance(self.hass)
+
+        async def latest(statistic_id: str) -> dict[str, Any] | None:
+            rows = await recorder.async_add_executor_job(
+                get_last_statistics,
+                self.hass,
+                1,
+                statistic_id,
+                True,
+                {"state", "sum"},
+            )
+            return _format_latest(rows.get(statistic_id, []))
+
+        consumption_latest = await latest(self.consumption_statistic_id)
+        cost_latest = await latest(self.cost_statistic_id)
+        standing_latest = await latest(self.standing_charge_statistic_id)
+
+        return {
+            "recorder_verified": bool(
+                consumption_latest and cost_latest and standing_latest
+            ),
+            "latest_consumption_statistic": consumption_latest,
+            "latest_cost_statistic": cost_latest,
+            "latest_standing_charge_statistic": standing_latest,
+        }
+
+    async def _async_has_statistic(self, statistic_id: str) -> bool:
+        """Return whether a statistic already has data."""
+        stats = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics,
+            self.hass,
+            1,
+            statistic_id,
+            True,
+            {"sum"},
+        )
+        return bool(stats.get(statistic_id))
 
     async def _async_get_base_sums(
         self,
         first_start: datetime,
+        statistic_ids: set[str],
     ) -> dict[str, float]:
         """Find cumulative sums immediately before the first imported hour."""
-        statistic_ids = {
-            self.consumption_statistic_id,
-            self.cost_statistic_id,
-        }
         bases = {statistic_id: 0.0 for statistic_id in statistic_ids}
         unresolved = set(statistic_ids)
 
-        # Normal rolling-update case: the first hour already exists. Its
-        # previous cumulative value is exactly sum - state.
         exact = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
@@ -393,12 +670,10 @@ class PowershopStatisticsManager:
         if not unresolved:
             return bases
 
-        # If the first imported hour is new, use the latest stored sum before
-        # it. A 35-day lookback covers the normal 30-day correction window.
         previous = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
-            first_start - timedelta(days=35),
+            first_start - timedelta(days=70),
             first_start,
             unresolved,
             "hour",
@@ -414,8 +689,6 @@ class PowershopStatisticsManager:
         if not unresolved:
             return bases
 
-        # Rare recovery path for a long data gap or a manual import of an older
-        # range: search all earlier statistics for the previous cumulative sum.
         history = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
