@@ -20,6 +20,7 @@ A Home Assistant custom component for **Powershop New Zealand** customers. Monit
 - **Automatic Token Refresh** — stays authenticated in the background
 - **Regular Updates** — 15-minute refresh interval
 - **Home Assistant Energy Dashboard** — imports Powershop kWh and total electricity cost as long-term statistics, including the daily standing charge
+- **Daily Charge Grid Source** — optional zero-kWh companion statistic lets Home Assistant include the standing charge in split Peak/Off Peak cost totals without distorting either tariff
 - **Time-of-Use Statistics** — creates separate consumption and cost statistics for the actual Powershop tariff bands returned by your agreement (for example Peak, Off-Peak, Night, or Controlled)
 - **Automatic Historical Corrections** — 60-day initial/migration backfill and a rolling 30-day correction sync every 12 hours
 - **DST-safe Interval Data** — handles New Zealand daylight-saving transitions without assuming every day has exactly 24 hours
@@ -87,6 +88,7 @@ The primary statistics are:
 - `powershop_nz:<account>_<property>_energy_consumption` — total imported electricity in kWh
 - `powershop_nz:<account>_<property>_energy_cost` — total electricity cost, including usage plus the daily standing charge
 - `powershop_nz:<account>_<property>_standing_charge_cost` — standing/daily charge on its own
+- `powershop_nz:<account>_<property>_standing_charge_energy` — always-zero kWh companion statistic for representing the fixed daily charge as a separate Home Assistant grid source
 
 The account/property parts are normalised into valid Home Assistant statistic IDs.
 
@@ -103,22 +105,40 @@ Use this if you want the Energy Dashboard to show one Powershop source with the 
 
 This configuration uses Powershop's interval consumption cost plus the daily standing charge. The total-cost statistic intentionally includes the standing charge only once per local day.
 
-### Option 2 — Split Peak and Off Peak in the Energy Dashboard
+### Option 2 — Split Peak and Off Peak, including Daily Charge
 
-Use this if you want the built-in **Electricity** graph and **Totals** table to show Peak and Off Peak separately.
+Use this if you want the built-in **Electricity** graph and **Totals** table to show Peak and Off Peak separately **and** still include the daily standing charge in the final cost total.
 
-Create **two grid connections**:
+Create **three grid connections**:
 
 | Grid connection | Energy imported from grid | Total-cost statistic | Display name |
 |---|---|---|---|
 | Peak | **Powershop NZ Peak consumption** | **Powershop NZ Peak cost** | Peak |
 | Off Peak | **Powershop NZ Off Peak consumption** | **Powershop NZ Off Peak cost** | Off Peak |
+| Daily Charge | **Powershop NZ Daily Charge (0 kWh)** | **Powershop NZ standing charge cost** | Daily Charge |
 
-Home Assistant will then show separate Peak/Off Peak series in the Electricity chart, and the Totals table will show each source plus the summed total.
+The Daily Charge energy statistic is intentionally always **0 kWh**. Home Assistant requires every grid source to have an energy statistic, so the zero-kWh companion lets the standing charge participate in the built-in cost totals without assigning any fixed charge to Peak or Off Peak.
 
-**Do not also add `Powershop NZ electricity consumption` as a third grid source.** The total consumption statistic is already the sum of the tariff periods, so adding it alongside Peak and Off Peak would double-count your electricity usage.
+The resulting Energy Sources / Totals view is conceptually:
 
-The tariff-specific cost statistics contain the variable electricity charge for each tariff band. The separate standing charge is **not** added to Peak or Off Peak individually. If you need the closest match to the complete Powershop bill, use **Option 1**. The `Powershop NZ standing charge cost` statistic remains available for custom cards/auditing when using the split view.
+```text
+Peak           <peak kWh>      <peak usage cost>
+Off Peak       <off-peak kWh>  <off-peak usage cost>
+Daily Charge   0 kWh           <standing charge>
+-----------------------------------------------
+Total          total kWh       total electricity cost
+```
+
+The **Electricity** graph still contains the real Peak and Off Peak energy data; the Daily Charge source has only zero-energy points. Depending on the Home Assistant frontend version/theme, it may still appear in the graph legend even though its plotted energy is zero.
+
+**Do not also add `Powershop NZ electricity consumption` as another grid source.** The total consumption statistic is already the sum of the tariff periods, so adding it alongside Peak and Off Peak would double-count your electricity usage.
+
+This split configuration keeps all three accounting components honest:
+
+- **Peak cost** = Peak variable usage only
+- **Off Peak cost** = Off Peak variable usage only
+- **Daily Charge** = fixed standing charge only
+- **Grid Total cost** = Peak + Off Peak + Daily Charge
 
 ### Time-of-use detection
 
@@ -180,11 +200,12 @@ So if Off Peak is configured before Peak, either reorder the grid connections or
 
 Go to **Developer Tools → Statistics** and search for `Powershop`.
 
-A working v2.3.1 setup can include:
+A working v2.4.0 setup can include:
 
 - Powershop NZ electricity consumption
 - Powershop NZ electricity cost
 - Powershop NZ standing charge cost
+- Powershop NZ Daily Charge (0 kWh)
 - Powershop NZ Peak consumption / cost
 - Powershop NZ Off Peak consumption / cost
 - additional tariff bands such as Night or Controlled if they exist on the account
@@ -212,7 +233,7 @@ The response includes useful fields such as:
 
 - `source_frequency` — for example `THIRTY_MIN_INTERVAL`
 - `standing_charge_days`
-- the generated total/standing-charge statistic IDs
+- the generated total/standing-charge statistic IDs, including the zero-kWh Daily Charge companion statistic
 - `tariff_periods` with the discovered tariff names, bucket IDs and rates
 - `recorder_verified`
 - the latest total consumption, cost and standing-charge statistics
@@ -248,6 +269,14 @@ HACS installs the published GitHub release. After downloading an update, **resta
 **"Email address not found" during setup** Even if your email is correct, this can happen if your account hasn't yet been migrated to Powershop's new platform. Powershop is doing a staged rollout — check if you can log in at app.powershop.nz first. If you can't, your account isn't on the new system yet and you'll need to wait or contact Powershop.
 
 ## 📝 Changelog
+
+### v2.4.0 (2026-09-27)
+- Added `Powershop NZ Daily Charge (0 kWh)`, an always-zero long-term energy statistic designed to pair with `Powershop NZ standing charge cost` as a separate Home Assistant grid source
+- Split Energy Dashboard setups can now use three sources — Peak, Off Peak, and Daily Charge — so the built-in Totals cost includes the standing charge without modifying either tariff's cost statistic
+- Existing Peak, Off Peak, total consumption, total cost, and standing-charge statistic IDs remain unchanged
+- First v2.4 startup performs a 60-day background backfill when the Daily Charge companion statistic is missing, so the new grid source has historical zero-kWh data aligned with the cost history
+- Backfill diagnostics now return and verify the Daily Charge energy statistic
+- Updated README with the exact three-grid-source Home Assistant Energy Dashboard configuration
 
 ### v2.3.1 (2026-09-26)
 - Run long Powershop statistics imports as Home Assistant background tasks so the 60-day migration no longer blocks startup
