@@ -12,6 +12,35 @@ def safe_stat_key(value: str) -> str:
     return cleaned or "rate"
 
 
+def canonical_band_key(bucket: str, label: str) -> str:
+    """Return a stable human-friendly key for a Powershop rate band."""
+    upper_bucket = bucket.upper().strip()
+    lower_label = label.lower().strip()
+
+    # Kraken bucket names commonly use these prefixes.
+    if upper_bucket.startswith("OPK"):
+        return "off_peak"
+    if upper_bucket.startswith("PK"):
+        return "peak"
+    if upper_bucket.startswith("N"):
+        return "night"
+    if upper_bucket.startswith("CON"):
+        return "controlled"
+
+    if "off peak" in lower_label or "off-peak" in lower_label or "offpeak" in lower_label:
+        return "off_peak"
+    if "peak" in lower_label:
+        return "peak"
+    if "night" in lower_label:
+        return "night"
+    if "controlled" in lower_label:
+        return "controlled"
+    if "standard" in lower_label or "normal" in lower_label:
+        return "standard"
+
+    return safe_stat_key(label or bucket or "rate")
+
+
 def _parse_rate_cents(rate: dict[str, Any]) -> float | None:
     """Return the API rate in cents per kWh/day where available."""
     raw = rate.get("rateIncludingTax")
@@ -78,7 +107,7 @@ def extract_agreement_tou(account_data: dict[str, Any]) -> dict[str, Any]:
         if not is_consumption:
             continue
 
-        base_key = safe_stat_key(str(label) if label else bucket or "controlled")
+        base_key = canonical_band_key(bucket, str(label))
         key = base_key
         if key in used_keys:
             bucket_key = safe_stat_key(bucket)
@@ -285,7 +314,27 @@ def extract_interval_band_entries(
     result: list[tuple[str, float, float]] = []
     stats = ((node.get("metaData") or {}).get("statistics") or [])
 
+    # Prefer explicit per-band statistics. A generic CONSUMPTION_COST entry
+    # may represent the same interval total and must not be added alongside
+    # TOU bucket rows, otherwise the interval would be double-counted.
+    explicit_stats: list[dict[str, Any]] = []
+    bucket_names = {
+        str(band.get("bucket") or "").upper()
+        for band in (tou.get("rate_bands") or {}).values()
+        if band.get("bucket")
+    }
     for stat in stats:
+        label = str(stat.get("label") or "").strip()
+        stat_type = str(stat.get("type") or "").upper()
+        upper_label = label.upper()
+        if (
+            stat_type == "TOU_BUCKET_COST"
+            or upper_label.startswith("CONSUMPTION_CHARGE_")
+            or upper_label in bucket_names
+        ):
+            explicit_stats.append(stat)
+
+    for stat in explicit_stats:
         key = classify_stat_band(stat, tou)
         if not key:
             continue
