@@ -197,7 +197,13 @@ class PowershopStatisticsManager:
     @callback
     def _schedule_sync(self, reason: str) -> None:
         """Schedule a protected background import."""
-        task = self.hass.async_create_task(self._async_safe_sync(reason))
+        # This sync can take several minutes during the initial 60-day
+        # migration. Mark it as a background task so Home Assistant startup is
+        # not held open waiting for the import to finish.
+        task = self.hass.async_create_background_task(
+            self._async_safe_sync(reason),
+            f"{DOMAIN}-statistics-{reason}",
+        )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 

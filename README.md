@@ -158,6 +158,11 @@ HACS installs from the repository's default branch/release. After HACS downloads
 
 ## 📝 Changelog
 
+### v2.3.1 (2026-09-26)
+- Run long Powershop statistics imports as Home Assistant background tasks so the 60-day migration no longer blocks startup
+- Merge equivalent weekday/weekend tariff buckets when they represent the same semantic tariff at the same price (for example Weekday Off Peak + All Weekend Off Peak → one Off Peak statistic)
+- Preserve all underlying Powershop bucket mappings while presenting cleaner Peak/Off Peak statistics
+
 ### v2.3.0 (2026-09-26)
 - Total Energy Dashboard cost now includes Powershop's daily standing charge
 - Added a separate long-term standing-charge cost statistic

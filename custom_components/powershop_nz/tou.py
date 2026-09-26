@@ -75,7 +75,6 @@ def extract_agreement_tou(account_data: dict[str, Any]) -> dict[str, Any]:
     rate_bands: dict[str, dict[str, Any]] = {}
     bucket_to_key: dict[str, str] = {}
     standing_rate_nzd: float | None = None
-    used_keys: set[str] = set()
 
     for rate in agreement.get("rates") or []:
         band_category = str(rate.get("bandCategory") or "").upper()
@@ -108,24 +107,56 @@ def extract_agreement_tou(account_data: dict[str, Any]) -> dict[str, Any]:
             continue
 
         base_key = canonical_band_key(bucket, str(label))
+        existing = rate_bands.get(base_key)
+        rounded_rate = round(rate_cents, 6) if rate_cents is not None else None
+
+        # Powershop can expose separate weekday/weekend bucket names for the
+        # same semantic tariff at the same price (e.g. WDDOPK16 and WE24, both
+        # 25c/kWh). Collapse those into one Off Peak statistic.
+        if existing is not None:
+            existing_rate = existing.get("rate_c_per_kwh")
+            same_rate = (
+                existing_rate is None
+                or rounded_rate is None
+                or abs(float(existing_rate) - float(rounded_rate)) < 0.0001
+            )
+            if same_rate:
+                if bucket:
+                    bucket_to_key[bucket] = base_key
+                    buckets = existing.setdefault("buckets", [])
+                    if bucket not in buckets:
+                        buckets.append(bucket)
+                labels = existing.setdefault("source_labels", [])
+                if str(label) not in labels:
+                    labels.append(str(label))
+                continue
+
         key = base_key
-        if key in used_keys:
-            bucket_key = safe_stat_key(bucket)
-            if bucket_key and bucket_key != key:
-                key = f"{base_key}_{bucket_key}"
+        if key in rate_bands:
+            suffix_source = safe_stat_key(bucket or str(label))
+            key = f"{base_key}_{suffix_source}"
             suffix = 2
             candidate = key
-            while candidate in used_keys:
+            while candidate in rate_bands:
                 candidate = f"{key}_{suffix}"
                 suffix += 1
             key = candidate
-        used_keys.add(key)
+
+        canonical_name = {
+            "off_peak": "Off Peak",
+            "peak": "Peak",
+            "night": "Night",
+            "controlled": "Controlled",
+            "standard": "Standard",
+        }.get(base_key, str(label))
 
         band = {
             "key": key,
-            "name": str(label),
+            "name": canonical_name if key == base_key else str(label),
             "bucket": bucket,
-            "rate_c_per_kwh": round(rate_cents, 6) if rate_cents is not None else None,
+            "buckets": [bucket] if bucket else [],
+            "source_labels": [str(label)],
+            "rate_c_per_kwh": rounded_rate,
             "rate_nzd_per_kwh": (
                 round(rate_cents / 100, 6) if rate_cents is not None else None
             ),
@@ -260,9 +291,8 @@ def classify_stat_band(stat: dict[str, Any], tou: dict[str, Any]) -> str | None:
         return None
 
     # Legacy responses may use the TOU bucket name directly as the label.
-    for key, band in rate_bands.items():
-        bucket = str(band.get("bucket") or "")
-        if bucket and label.upper() == bucket.upper():
+    for bucket, key in (tou.get("bucket_to_key") or {}).items():
+        if label.upper() == str(bucket).upper():
             return key
 
     kwh, cost_cents = _stat_value_cost(stat)
@@ -319,9 +349,9 @@ def extract_interval_band_entries(
     # TOU bucket rows, otherwise the interval would be double-counted.
     explicit_stats: list[dict[str, Any]] = []
     bucket_names = {
-        str(band.get("bucket") or "").upper()
-        for band in (tou.get("rate_bands") or {}).values()
-        if band.get("bucket")
+        str(bucket).upper()
+        for bucket in (tou.get("bucket_to_key") or {})
+        if bucket
     }
     for stat in stats:
         label = str(stat.get("label") or "").strip()
