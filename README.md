@@ -5,7 +5,7 @@
 # Powershop New Zealand — Home Assistant Integration
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/custom-components/hacs)
-[![GitHub Release](https://img.shields.io/github/release/PMKA/powershop-nz.svg)](https://github.com/PMKA/powershop-nz/releases)
+[![GitHub Release](https://img.shields.io/github/release/Nel-E/powershop-nz.svg)](https://github.com/Nel-E/powershop-nz/releases)
 
 A Home Assistant custom component for **Powershop New Zealand** customers. Monitor your account balance, electricity rates, usage, and Power Pack coverage — updated every 15 minutes.
 
@@ -19,8 +19,10 @@ A Home Assistant custom component for **Powershop New Zealand** customers. Monit
 - **Passwordless Auth** — uses Powershop's email OTP login (no password stored)
 - **Automatic Token Refresh** — stays authenticated in the background
 - **Regular Updates** — 15-minute refresh interval
-- **Home Assistant Energy Dashboard** — imports Powershop hourly kWh and consumption cost as long-term statistics, with a 60-day initial backfill and automatic correction sync every 12 hours
-- **DST-safe Hourly Data** — handles New Zealand 23/24/25-hour daylight-saving days without assuming every day has exactly 24 intervals
+- **Home Assistant Energy Dashboard** — imports Powershop kWh and total electricity cost as long-term statistics, including the daily standing charge
+- **Time-of-Use Statistics** — creates separate consumption and cost statistics for the actual Powershop tariff bands returned by your agreement (for example Peak, Off-Peak, Night, or Controlled)
+- **Automatic Historical Corrections** — 60-day initial/migration backfill and a rolling 30-day correction sync every 12 hours
+- **DST-safe Interval Data** — handles New Zealand daylight-saving transitions without assuming every day has exactly 24 hours
 
 ## Requirements
 
@@ -76,14 +78,15 @@ Your account number and property ID are discovered automatically. Home Assistant
 
 ## Home Assistant Energy Dashboard
 
-Version 2.2.0 adds native long-term statistics for Home Assistant's Energy Dashboard.
+Version 2.3.0 keeps the existing Energy Dashboard statistic IDs from v2.2, so an existing dashboard does not need to be reconfigured.
 
-After installing/updating the integration and restarting Home Assistant, the integration automatically backfills the latest **60 days** of completed hourly Powershop data. Every 12 hours it re-imports the latest **30 days**, allowing Powershop estimates to be replaced by later actual meter readings.
+After installing/updating and restarting Home Assistant, the integration automatically imports Powershop interval data. A new v2.3 installation or migration backfills the latest **60 days**; subsequent automatic runs re-read the latest **30 days** every 12 hours so estimated readings can be replaced by later actual meter data.
 
-Two external statistics are created for each configured account/property:
+The primary statistics are:
 
-- `powershop_nz:<account>_<property>_energy_consumption` — cumulative imported electricity in kWh
-- `powershop_nz:<account>_<property>_energy_cost` — cumulative Powershop consumption cost in NZD
+- `powershop_nz:<account>_<property>_energy_consumption` — total imported electricity in kWh
+- `powershop_nz:<account>_<property>_energy_cost` — total Powershop electricity cost in NZD, including consumption plus the daily standing charge
+- `powershop_nz:<account>_<property>_standing_charge_cost` — the standing-charge component on its own
 
 The account/property portions are normalised to valid Home Assistant statistic IDs.
 
@@ -95,7 +98,22 @@ The account/property portions are normalised to valid Home Assistant statistic I
 4. For cost, choose **Use an entity/statistic tracking total costs**
 5. Select **Powershop NZ electricity cost**
 
-The cost statistic uses the interval consumption cost returned by Powershop rather than recalculating cost from the displayed peak/off-peak rate sensors. The daily standing charge remains separate and is not included in the Energy Dashboard consumption-cost statistic.
+The total cost uses Powershop's own interval consumption cost plus the historical standing charge returned by Powershop. For the current day, the active agreement's full daily standing charge is used because Powershop can return a prorated value while the day is still in progress.
+
+### Time-of-use statistics
+
+Powershop exposes the active agreement's TOU bucket names, rates and schedule. The integration uses that data — and, where available, each measurement's own per-bucket kWh/cost metadata — instead of hard-coding tariff hours.
+
+For every tariff band detected on your account, v2.3 creates a pair of external statistics, for example:
+
+- `..._energy_consumption_peak` and `..._energy_cost_peak`
+- `..._energy_consumption_off_peak` and `..._energy_cost_off_peak`
+- `..._energy_consumption_night` and `..._energy_cost_night`
+- `..._energy_consumption_controlled` and `..._energy_cost_controlled`
+
+The exact set depends on your Powershop plan. These are intended for tariff analysis/custom statistic graphs. Keep the existing total Powershop consumption statistic as the grid source in the Energy Dashboard unless you deliberately want to model the tariff bands as separate grid sources.
+
+The importer prefers 30-minute Powershop measurements for TOU allocation, so boundaries such as 09:30 can be represented correctly. It falls back to hourly measurements if 30-minute data is unavailable.
 
 ### Manual history backfill
 
@@ -108,7 +126,7 @@ Fields:
 - `days` — number of local calendar days to import, from 1 to 365 (default 60)
 - `config_entry_id` — optional unless more than one Powershop NZ account is configured
 
-The action returns the number of imported hourly rows and the generated statistic IDs.
+The action returns the number of imported hourly rows, Recorder verification, the standing-charge statistic ID, and the tariff periods/statistic IDs detected from your Powershop agreement.
 
 ### Updating this fork with HACS
 
@@ -116,7 +134,7 @@ Add this fork as the HACS custom repository:
 
 `https://github.com/Nel-E/powershop-nz`
 
-HACS installs from the repository's default branch/release, so Energy Dashboard changes are merged to `main` and the integration manifest version is **2.2.0**. After HACS downloads the update, restart Home Assistant.
+HACS installs from the repository's default branch/release. After HACS downloads the update, restart Home Assistant.
 
 ### Sensor Attributes
 
@@ -139,6 +157,16 @@ HACS installs from the repository's default branch/release, so Energy Dashboard 
 **"Email address not found" during setup** Even if your email is correct, this can happen if your account hasn't yet been migrated to Powershop's new platform. Powershop is doing a staged rollout — check if you can log in at app.powershop.nz first. If you can't, your account isn't on the new system yet and you'll need to wait or contact Powershop.
 
 ## 📝 Changelog
+
+### v2.3.0 (2026-09-26)
+- Total Energy Dashboard cost now includes Powershop's daily standing charge
+- Added a separate long-term standing-charge cost statistic
+- Added dynamic per-tariff-band consumption and cost statistics from the active Powershop agreement
+- Added TOU agreement metadata query: bucket names, band categories, raw rates and time-of-use schedule
+- TOU allocation prefers Powershop's per-measurement bucket metadata and falls back to the API schedule when needed
+- Uses 30-minute measurements for tariff allocation when available, with hourly fallback
+- Existing v2.2 total consumption/cost statistic IDs are unchanged, so existing Energy Dashboard configuration continues working
+- First v2.3 sync automatically reprocesses 60 days so existing cost history gains the standing charge
 
 ### v2.2.1 (2026-09-26)
 - Wait for Home Assistant Recorder to commit imported external statistics before the backfill action returns
