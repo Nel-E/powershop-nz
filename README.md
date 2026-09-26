@@ -44,7 +44,7 @@ A Home Assistant custom component for **Powershop New Zealand** customers. Monit
 ### Manual Installation
 
 1. Download or clone this repository
-2. Copy the `custom_components/powershop/` folder into your HA config's `custom_components/` directory
+2. Copy the `custom_components/powershop_nz/` folder into your HA config's `custom_components/` directory
 3. Restart Home Assistant
 
 ## Configuration
@@ -66,7 +66,7 @@ Your account number and property ID are discovered automatically. Home Assistant
 | `sensor.powershop_nz_off_peak_rate` | Off-peak electricity rate | c/kWh |
 | `sensor.powershop_nz_peak_rate` | Peak electricity rate | c/kWh |
 | `sensor.powershop_nz_shoulder_rate` | Shoulder electricity rate | c/kWh |
-| `sensor.powershop_nz_usage_today` | kWh consumed today (last 24 h) | kWh |
+| `sensor.powershop_nz_usage_today` | kWh consumed for the current Auckland-local day | kWh |
 | `sensor.powershop_nz_usage_billing_period` | kWh consumed this billing period | kWh |
 | `sensor.powershop_nz_cost_billing_period` | Cost for the current billing period | NZD |
 | `sensor.powershop_nz_period_used_cost` | Actual metered spend so far this billing period | NZD |
@@ -78,46 +78,122 @@ Your account number and property ID are discovered automatically. Home Assistant
 
 ## Home Assistant Energy Dashboard
 
-Version 2.3.0 keeps the existing Energy Dashboard statistic IDs from v2.2, so an existing dashboard does not need to be reconfigured.
+Powershop NZ can feed Home Assistant's built-in **Energy Dashboard** using external long-term statistics. The statistics are written directly to Home Assistant Recorder; they are not normal `sensor.*` entities, so look for them under **Developer Tools → Statistics** rather than **Developer Tools → States**.
 
-After installing/updating and restarting Home Assistant, the integration automatically imports Powershop interval data. A new v2.3 installation or migration backfills the latest **60 days**; subsequent automatic runs re-read the latest **30 days** every 12 hours so estimated readings can be replaced by later actual meter data.
+After installing or updating the integration, **restart Home Assistant**. On a new v2.3 installation or migration, the integration automatically starts a **60-day historical import in the background**. Normal operation re-reads the latest **30 days every 12 hours** so Powershop estimates can later be replaced by actual meter readings without moving the usage to the wrong date.
 
 The primary statistics are:
 
 - `powershop_nz:<account>_<property>_energy_consumption` — total imported electricity in kWh
-- `powershop_nz:<account>_<property>_energy_cost` — total Powershop electricity cost in NZD, including consumption plus the daily standing charge
-- `powershop_nz:<account>_<property>_standing_charge_cost` — the standing-charge component on its own
+- `powershop_nz:<account>_<property>_energy_cost` — total electricity cost, including usage plus the daily standing charge
+- `powershop_nz:<account>_<property>_standing_charge_cost` — standing/daily charge on its own
 
-The account/property portions are normalised to valid Home Assistant statistic IDs.
+The account/property parts are normalised into valid Home Assistant statistic IDs.
 
-### Add Powershop to the Energy Dashboard
+### Option 1 — Single total grid source
+
+Use this if you want the Energy Dashboard to show one Powershop source with the most bill-like total cost.
 
 1. Go to **Settings → Dashboards → Energy**
-2. Under **Electricity grid**, add or edit **Grid consumption**
-3. For imported energy, select the statistic whose name begins **Powershop NZ electricity consumption**
-4. For cost, choose **Use an entity/statistic tracking total costs**
-5. Select **Powershop NZ electricity cost**
+2. Under **Electricity grid**, add or edit a grid connection
+3. **Energy imported from grid:** select **Powershop NZ electricity consumption**
+4. Under **Cost tracking**, select **Use an entity tracking the total costs**
+5. **Entity with the total costs:** select **Powershop NZ electricity cost**
+6. Save
 
-The total cost uses Powershop's own interval consumption cost plus the historical standing charge returned by Powershop. For the current day, the active agreement's full daily standing charge is used because Powershop can return a prorated value while the day is still in progress.
+This configuration uses Powershop's interval consumption cost plus the daily standing charge. The total-cost statistic intentionally includes the standing charge only once per local day.
 
-### Time-of-use statistics
+### Option 2 — Split Peak and Off Peak in the Energy Dashboard
 
-Powershop exposes the active agreement's TOU bucket names, rates and schedule. The integration uses that data — and, where available, each measurement's own per-bucket kWh/cost metadata — instead of hard-coding tariff hours.
+Use this if you want the built-in **Electricity** graph and **Totals** table to show Peak and Off Peak separately.
 
-For every tariff band detected on your account, v2.3 creates a pair of external statistics, for example:
+Create **two grid connections**:
 
-- `..._energy_consumption_peak` and `..._energy_cost_peak`
-- `..._energy_consumption_off_peak` and `..._energy_cost_off_peak`
-- `..._energy_consumption_night` and `..._energy_cost_night`
-- `..._energy_consumption_controlled` and `..._energy_cost_controlled`
+| Grid connection | Energy imported from grid | Total-cost statistic | Display name |
+|---|---|---|---|
+| Peak | **Powershop NZ Peak consumption** | **Powershop NZ Peak cost** | Peak |
+| Off Peak | **Powershop NZ Off Peak consumption** | **Powershop NZ Off Peak cost** | Off Peak |
 
-The exact set depends on your Powershop plan. These are intended for tariff analysis/custom statistic graphs. Keep the existing total Powershop consumption statistic as the grid source in the Energy Dashboard unless you deliberately want to model the tariff bands as separate grid sources.
+Home Assistant will then show separate Peak/Off Peak series in the Electricity chart, and the Totals table will show each source plus the summed total.
 
-The importer prefers 30-minute Powershop measurements for TOU allocation, so boundaries such as 09:30 can be represented correctly. It falls back to hourly measurements if 30-minute data is unavailable.
+**Do not also add `Powershop NZ electricity consumption` as a third grid source.** The total consumption statistic is already the sum of the tariff periods, so adding it alongside Peak and Off Peak would double-count your electricity usage.
 
-### Manual history backfill
+The tariff-specific cost statistics contain the variable electricity charge for each tariff band. The separate standing charge is **not** added to Peak or Off Peak individually. If you need the closest match to the complete Powershop bill, use **Option 1**. The `Powershop NZ standing charge cost` statistic remains available for custom cards/auditing when using the split view.
 
-A service action is available at **Developer Tools → Actions**:
+### Time-of-use detection
+
+The integration does not hard-code Peak/Off Peak clock times. It reads the active Powershop agreement and discovers the real tariff buckets, rates and time-of-use schedule for that account.
+
+Where available, Powershop's own per-measurement tariff metadata is used. The importer prefers **30-minute measurements** for TOU allocation, which allows tariff boundaries such as 09:30 to be represented correctly. It falls back to hourly measurements if 30-minute data is unavailable.
+
+For every tariff band detected, the integration creates consumption and cost statistics such as:
+
+- `..._energy_consumption_peak` / `..._energy_cost_peak`
+- `..._energy_consumption_off_peak` / `..._energy_cost_off_peak`
+- `..._energy_consumption_night` / `..._energy_cost_night`
+- `..._energy_consumption_controlled` / `..._energy_cost_controlled`
+
+v2.3.1 also merges equivalent tariff buckets when Powershop exposes different weekday/weekend bucket IDs that represent the same semantic tariff at the same price. For example, a weekday Off Peak bucket and an all-weekend Off Peak bucket at the same rate are presented as one **Off Peak** statistic while their original Powershop bucket mappings are retained internally.
+
+If you upgraded from v2.3.0, an older statistic such as **Powershop NZ All Weekend Off Peak consumption** may remain in Home Assistant Recorder. Do not use that legacy statistic for new Energy Dashboard configuration; use the merged **Powershop NZ Off Peak consumption/cost** statistics.
+
+### Change Peak and Off Peak colours
+
+Home Assistant assigns multiple grid-source colours by their position in the Energy configuration. You can override those colours in a theme.
+
+If your `configuration.yaml` already contains:
+
+```yaml
+frontend:
+  themes: !include_dir_merge_named themes
+```
+
+create a file such as:
+
+`/config/themes/powershop_energy.yaml`
+
+(File Editor on Home Assistant OS may display the same location as `/homeassistant/themes/powershop_energy.yaml`.)
+
+Example:
+
+```yaml
+Powershop Energy:
+  energy-grid-consumption-color-0: "#F57C00"   # first grid source — Peak
+  energy-grid-consumption-color-1: "#2E7D32"   # second grid source — Off Peak
+```
+
+Then:
+
+1. Go to **Developer Tools → YAML** and run **Reload themes**, or restart Home Assistant
+2. Open your user **Profile / Appearance**
+3. Select the **Powershop Energy** theme
+4. Refresh the Energy Dashboard
+
+The colour index follows the order of the configured grid sources:
+
+- `color-0` = first grid connection
+- `color-1` = second grid connection
+
+So if Off Peak is configured before Peak, either reorder the grid connections or swap the two colour values.
+
+### Verify imported statistics
+
+Go to **Developer Tools → Statistics** and search for `Powershop`.
+
+A working v2.3.1 setup can include:
+
+- Powershop NZ electricity consumption
+- Powershop NZ electricity cost
+- Powershop NZ standing charge cost
+- Powershop NZ Peak consumption / cost
+- Powershop NZ Off Peak consumption / cost
+- additional tariff bands such as Night or Controlled if they exist on the account
+
+The external statistics should show **No issue**.
+
+### Manual history backfill / diagnostics
+
+A service action is available under **Developer Tools → Actions**:
 
 `powershop_nz.backfill_energy_statistics`
 
@@ -126,15 +202,30 @@ Fields:
 - `days` — number of local calendar days to import, from 1 to 365 (default 60)
 - `config_entry_id` — optional unless more than one Powershop NZ account is configured
 
-The action returns the number of imported hourly rows, Recorder verification, the standing-charge statistic ID, and the tariff periods/statistic IDs detected from your Powershop agreement.
+For a quick diagnostic, run it with:
+
+```yaml
+days: 1
+```
+
+The response includes useful fields such as:
+
+- `source_frequency` — for example `THIRTY_MIN_INTERVAL`
+- `standing_charge_days`
+- the generated total/standing-charge statistic IDs
+- `tariff_periods` with the discovered tariff names, bucket IDs and rates
+- `recorder_verified`
+- the latest total consumption, cost and standing-charge statistics
+
+`recorder_verified: true` confirms that Home Assistant Recorder accepted the imported statistics.
 
 ### Updating this fork with HACS
 
-Add this fork as the HACS custom repository:
+Add this repository to **HACS → Integrations → Custom repositories** as an **Integration**:
 
 `https://github.com/Nel-E/powershop-nz`
 
-HACS installs from the repository's default branch/release. After HACS downloads the update, restart Home Assistant.
+HACS installs the published GitHub release. After downloading an update, **restart Home Assistant** so the custom integration code is reloaded.
 
 ### Sensor Attributes
 
@@ -162,6 +253,11 @@ HACS installs from the repository's default branch/release. After HACS downloads
 - Run long Powershop statistics imports as Home Assistant background tasks so the 60-day migration no longer blocks startup
 - Merge equivalent weekday/weekend tariff buckets when they represent the same semantic tariff at the same price (for example Weekday Off Peak + All Weekend Off Peak → one Off Peak statistic)
 - Preserve all underlying Powershop bucket mappings while presenting cleaner Peak/Off Peak statistics
+- Verified Home Assistant Energy Dashboard operation with 30-minute Powershop interval data, dynamic Peak/Off Peak discovery, Recorder persistence, total consumption cost and standing-charge history
+- Documented both supported Energy Dashboard layouts: one total grid source (billing-style total cost) or separate Peak/Off Peak grid sources
+- Documented matching Peak/Off Peak cost statistics, double-counting warning when using split grid sources, and the standing-charge limitation of the split view
+- Added Home Assistant theme examples for assigning distinct Peak and Off Peak colours in the built-in Energy graph
+- Added troubleshooting/verification guidance using Developer Tools → Statistics and `powershop_nz.backfill_energy_statistics`
 
 ### v2.3.0 (2026-09-26)
 - Total Energy Dashboard cost now includes Powershop's daily standing charge
