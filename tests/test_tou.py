@@ -44,8 +44,15 @@ def sample_agreement() -> dict:
                                 "rateIncludingTax": "40.77",
                             },
                             {
-                                "displayLabel": "Off Peak",
-                                "touBucketName": "OPK10",
+                                "displayLabel": "Weekday Off Peak",
+                                "touBucketName": "WDDOPK16",
+                                "bandCategory": "CONSUMPTION_CHARGE",
+                                "unitType": "Kilowatt-hours consumed",
+                                "rateIncludingTax": "27.92",
+                            },
+                            {
+                                "displayLabel": "All Weekend Off Peak",
+                                "touBucketName": "WE24",
                                 "bandCategory": "CONSUMPTION_CHARGE",
                                 "unitType": "Kilowatt-hours consumed",
                                 "rateIncludingTax": "27.92",
@@ -84,7 +91,7 @@ def sample_agreement() -> dict:
                                         "weekends": False,
                                     },
                                     {
-                                        "timeslot": "OPK10",
+                                        "timeslot": "WDDOPK16",
                                         "activeFrom": "09:30:00",
                                         "activeTo": "17:30:00",
                                         "weekdays": True,
@@ -98,16 +105,16 @@ def sample_agreement() -> dict:
                                         "weekends": False,
                                     },
                                     {
-                                        "timeslot": "OPK10",
+                                        "timeslot": "WDDOPK16",
                                         "activeFrom": "20:00:00",
                                         "activeTo": "22:00:00",
                                         "weekdays": True,
                                         "weekends": False,
                                     },
                                     {
-                                        "timeslot": "OPK10",
-                                        "activeFrom": "07:00:00",
-                                        "activeTo": "22:00:00",
+                                        "timeslot": "WE24",
+                                        "activeFrom": "00:00:00",
+                                        "activeTo": "00:00:00",
                                         "weekdays": False,
                                         "weekends": True,
                                     },
@@ -134,6 +141,18 @@ class TouHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(
             self.tou["rate_bands"]["peak"]["rate_nzd_per_kwh"],
             0.4077,
+        )
+        self.assertEqual(
+            self.tou["bucket_to_key"]["WDDOPK16"],
+            "off_peak",
+        )
+        self.assertEqual(
+            self.tou["bucket_to_key"]["WE24"],
+            "off_peak",
+        )
+        self.assertEqual(
+            set(self.tou["rate_bands"]["off_peak"]["buckets"]),
+            {"WDDOPK16", "WE24"},
         )
 
     def test_schedule_classifies_weekday_and_weekend(self) -> None:
