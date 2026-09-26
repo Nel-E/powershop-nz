@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
+from .tou import extract_agreement_tou
+
 from .const import (
     BRAND,
     BRAND_GQL,
@@ -109,6 +111,7 @@ query measurements(
                   }
                 }
                 statistics {
+                  label
                   type
                   value
                   costInclTax {
@@ -204,7 +207,9 @@ query measurementsPeriod(
                   }
                 }
                 statistics {
+                  label
                   type
+                  value
                   costInclTax {
                     estimatedAmount
                   }
@@ -229,8 +234,31 @@ fragment AgreementFields on Agreement {
     label
     displayLabel
     hasDiscount
+    rateIncludingTax
     formattedRateExcludingTax
     formattedRateIncludingTax
+    bandCategory
+    unitType
+    touBucketName
+  }
+  timeOfUseSchemes {
+    name
+    timeslots {
+      timeslot
+      activeFrom
+      activeTo
+      weekdays
+      weekends
+      saturdays
+      sundays
+      season {
+        name
+        startDay
+        startMonth
+        endDay
+        endMonth
+      }
+    }
   }
 }
 
@@ -277,34 +305,52 @@ def _parse_rate(formatted: str) -> Optional[float]:
     return float(match.group(1)) if match else None
 
 
-def normalise_hourly_usage(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Return Home Assistant-friendly hourly usage rows."""
-    return [
-        {
-            "start_at": node.get("startAt"),
-            "end_at": node.get("endAt"),
-            "read_at": node.get("readAt"),
-            "kwh": round(float(node.get("value") or 0), 4),
-            "reading_quality": (
-                ((node.get("metaData") or {}).get("utilityFilters") or {}).get(
-                    "readingQuality"
-                )
-            ),
-            "cost_incl_tax_estimated_nzd": round(
-                sum(
-                    float(
-                        (stat.get("costInclTax") or {}).get("estimatedAmount") or 0
-                    )
-                    for stat in (node.get("metaData") or {}).get("statistics", [])
-                    if stat.get("type") == "CONSUMPTION_COST"
-                )
-                / 100,
-                4,
-            ),
-        }
-        for node in nodes
-    ]
+def _measurement_cost_nzd(
+    node: Dict[str, Any], statistic_types: set[str]
+) -> float:
+    """Return the sum of selected Powershop cost components in NZD."""
+    cents = 0.0
+    for stat in (node.get("metaData") or {}).get("statistics", []):
+        if stat.get("type") not in statistic_types:
+            continue
+        try:
+            cents += float(
+                (stat.get("costInclTax") or {}).get("estimatedAmount") or 0
+            )
+        except (TypeError, ValueError):
+            continue
+    return round(cents / 100, 4)
 
+
+def normalise_hourly_usage(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return Home Assistant-friendly hourly usage rows.
+
+    The total cost includes both consumption and any standing charge reported
+    by Powershop. The two components are also exposed separately.
+    """
+    rows: List[Dict[str, Any]] = []
+    for node in nodes:
+        usage_cost = _measurement_cost_nzd(node, {"CONSUMPTION_COST"})
+        standing_cost = _measurement_cost_nzd(node, {"STANDING_CHARGE_COST"})
+        rows.append(
+            {
+                "start_at": node.get("startAt"),
+                "end_at": node.get("endAt"),
+                "read_at": node.get("readAt"),
+                "kwh": round(float(node.get("value") or 0), 4),
+                "reading_quality": (
+                    ((node.get("metaData") or {}).get("utilityFilters") or {}).get(
+                        "readingQuality"
+                    )
+                ),
+                "usage_cost_incl_tax_estimated_nzd": usage_cost,
+                "standing_charge_incl_tax_estimated_nzd": standing_cost,
+                "cost_incl_tax_estimated_nzd": round(
+                    usage_cost + standing_cost, 4
+                ),
+            }
+        )
+    return rows
 
 def _next_billing_periods(
     period_start: str, period_end: str, count: int = 5
@@ -549,7 +595,7 @@ class PowershopAPIClient:
         contains exactly 24 hourly intervals; daylight-saving transition days
         can contain 23 or 25.
         """
-        first = 1000 if freq == "HOUR_INTERVAL" else 400
+        first = 1000 if freq in ("HOUR_INTERVAL", "THIRTY_MIN_INTERVAL") else 400
         data = await self._graphql(
             _MEASUREMENTS_RANGE_QUERY,
             {
@@ -637,7 +683,8 @@ class PowershopAPIClient:
         period_start = billing_options.get("currentBillingPeriodStartDate")
         period_end = billing_options.get("currentBillingPeriodEndDate")
 
-        # Extract rates from the first meter point's active agreement
+        # Extract rates and authoritative time-of-use metadata from the first
+        # meter point's active agreement.
         rate_periods: Dict[str, Any] = {}
         property_node = agreement_data.get("property", {})
         for mp in property_node.get("meterPoints", []):
@@ -645,13 +692,31 @@ class PowershopAPIClient:
             for rate in agreement.get("rates", []):
                 label = rate.get("displayLabel") or rate.get("label") or "Unknown"
                 raw_rate = _parse_rate(rate.get("formattedRateIncludingTax"))
+                rate_cents = rate.get("rateIncludingTax")
+                try:
+                    rate_cents_value = (
+                        float(rate_cents) if rate_cents is not None else None
+                    )
+                except (TypeError, ValueError):
+                    rate_cents_value = None
                 rate_periods[label] = {
-                    "rate": round(raw_rate * 100, 4) if raw_rate is not None else None,
+                    "rate": (
+                        round(rate_cents_value, 4)
+                        if rate_cents_value is not None
+                        else round(raw_rate * 100, 4)
+                        if raw_rate is not None
+                        else None
+                    ),
                     "rate_formatted": rate.get("formattedRateIncludingTax"),
                     "rate_excl_tax": rate.get("formattedRateExcludingTax"),
                     "has_discount": rate.get("hasDiscount", False),
+                    "band_category": rate.get("bandCategory"),
+                    "unit_type": rate.get("unitType"),
+                    "tou_bucket_name": rate.get("touBucketName"),
                 }
             break  # Only process first meter point
+
+        tou_data = extract_agreement_tou(agreement_data)
 
         # Compute upcoming billing period date ranges (next 5 months)
         future_periods = (
@@ -862,6 +927,10 @@ class PowershopAPIClient:
             "period_start": period_start,
             "period_end": period_end,
             "rate_periods": rate_periods,
+            "rate_bands": tou_data.get("rate_bands", {}),
+            "time_of_use_schemes": tou_data.get("time_of_use_schemes", []),
+            "agreement_name": tou_data.get("agreement_name"),
+            "standing_rate_nzd": tou_data.get("standing_rate_nzd"),
             "account_number": account_number,
             "usage_today_kwh": usage_today_kwh,
             "usage_period_kwh": usage_period_kwh,
